@@ -4,12 +4,26 @@
 # ///
 """Build a Daytona snapshot for the Agenta sandbox-agent runner.
 
-Bakes the `pi` CLI into a sandbox-agent base image (which already ships the sandbox-agent
-daemon, the Claude CLI, and CA certs) so Daytona runs don't pay a ~150s per-invoke
-`npm install pi`. Set the runner service to use it:
+The `-full` sandbox-agent base image already bakes ALL FOUR harnesses: its own build
+runs `sandbox-agent install-agent --all` as its last layer, which installs the claude,
+codex, and opencode native binaries + ACP adapters (verified by pulling the image
+manifest and inspecting the layer: `bin/claude`, `bin/codex` + `agent_processes/codex-acp`
+(`@zed-industries/codex-acp`), `bin/opencode` + `agent_processes/opencode-acp`), plus the
+`pi-acp` adapter for Pi. The ONE thing `install-agent --all` does NOT bake is the
+standalone `pi` CLI binary itself (`@earendil-works/pi-coding-agent`) that `pi-acp` shells
+out to -- so this script's only real job is adding that. Everything else below is a
+verify-and-mark step, not a re-install: we set the `_INSTALLED` marker for
+claude/codex/opencode too so `daytona.ts` never re-runs their daemon auto-install
+(currently a no-op safety net at runtime, since the daemon's own install is idempotent,
+but skipping it avoids the "is it already there" round-trip on every run) and never pays
+their (far larger) per-run cost were that ever to regress. Set the runner service to use
+this snapshot:
 
     DAYTONA_SNAPSHOT=agenta-sandbox-pi
-    AGENTA_AGENT_SANDBOX_PI_INSTALLED=false
+    AGENTA_AGENT_SANDBOX_PI_INSTALLED=true
+    AGENTA_AGENT_SANDBOX_CODEX_INSTALLED=true
+    AGENTA_AGENT_SANDBOX_OPENCODE_INSTALLED=true
+    AGENTA_AGENT_SANDBOX_CLAUDE_INSTALLED=true
 
 Run: DAYTONA_API_KEY=... DAYTONA_TARGET=eu uv run build_snapshot.py [--force]
 
@@ -70,14 +84,29 @@ def main() -> None:
         print(f"deleting existing snapshot '{SNAPSHOT_NAME}'...")
         daytona.snapshot.delete(existing)
 
-    # Base on the full sandbox-agent image (daemon + claude + certs) and add the pi CLI globally
-    # so it is on PATH for the sandbox user the daemon runs as. The image's default user
-    # is the non-root `sandbox`, so switch to root for the global install, then back.
+    # Base on the full sandbox-agent image and add the pi CLI globally so it is on PATH for
+    # the sandbox user the daemon runs as. The image's default user is the non-root
+    # `sandbox`, so switch to root for the global install, then back.
+    #
+    # claude/codex/opencode are NOT re-installed here: the base image's own last build layer
+    # already runs `sandbox-agent install-agent --all`, which bakes their native binaries
+    # and ACP adapters. We only verify that here (fail the build loudly if a future base tag
+    # drops one) instead of re-running `install-agent`, since the daemon's own install is
+    # idempotent but the verify is cheaper and documents the assumption in one place.
     image = Image.base(SANDBOX_AGENT_IMAGE).dockerfile_commands(
         [
             "USER root",
             f"RUN npm install -g --ignore-scripts {PI_PACKAGE}",
             "RUN pi --version || true",
+            # Base image already bakes these three via `install-agent --all`, run as the
+            # `sandbox` user (see module docstring); fail fast if a future base tag stops
+            # shipping one. Still root here, so the path is spelled out rather than $HOME.
+            "RUN test -x /home/sandbox/.local/share/sandbox-agent/bin/claude "
+            '&& echo "claude: baked in base image"',
+            "RUN test -x /home/sandbox/.local/share/sandbox-agent/bin/codex "
+            '&& echo "codex: baked in base image"',
+            "RUN test -x /home/sandbox/.local/share/sandbox-agent/bin/opencode "
+            '&& echo "opencode: baked in base image"',
             # Durable cwd: fuse + geesefs so the remote sandbox can mount its store prefix.
             "RUN apt-get update && apt-get install -y --no-install-recommends fuse curl "
             "&& rm -rf /var/lib/apt/lists/* && echo user_allow_other >> /etc/fuse.conf",

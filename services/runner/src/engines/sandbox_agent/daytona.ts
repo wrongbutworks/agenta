@@ -15,12 +15,20 @@ type Log = (message: string) => void;
 export const DAYTONA_PI_DIR =
   process.env.AGENTA_AGENT_SANDBOX_PI_DIR ?? "/home/sandbox/.pi/agent";
 
-// Some Daytona images ship the pi-acp adapter but not the `pi` CLI, so by default we install
-// it into the sandbox at session time and point pi-acp at it. A custom snapshot that
-// pre-installs `pi` can set AGENTA_AGENT_SANDBOX_PI_INSTALLED=false.
+// Default is install-OFF: we assume the configured snapshot already bakes `pi` (see
+// sandbox-images/daytona/build_snapshot.py), so we never pay its ~150s per-run npm
+// install unless told to. Set AGENTA_AGENT_SANDBOX_PI_INSTALLED=true to opt IN against a
+// bare, non-snapshot image. Back-compat: the old opt-OUT spelling (`=false`, from when
+// the default was install-ON) still resolves to off, so only deployments that relied on
+// the unset default change behavior — that silent per-run cost was the footgun.
+//
+// codex/opencode/claude have no session-time install path here (they only auto-install
+// via the sandbox-agent daemon itself, and the `-full` base image already bakes all
+// three), so the AGENTA_AGENT_SANDBOX_{CODEX,OPENCODE,CLAUDE}_INSTALLED names in
+// sandbox-images/daytona/README.md are reserved for symmetry only; nothing reads them.
 export const DAYTONA_PI_INSTALL_DIR = "/home/sandbox/.agenta-pi";
 export const DAYTONA_PI_INSTALL =
-  process.env.AGENTA_AGENT_SANDBOX_PI_INSTALLED !== "false";
+  process.env.AGENTA_AGENT_SANDBOX_PI_INSTALLED === "true";
 export const DAYTONA_PI_VERSION = process.env.AGENTA_AGENT_SANDBOX_PI_VERSION ?? "0.79.4";
 
 /**
