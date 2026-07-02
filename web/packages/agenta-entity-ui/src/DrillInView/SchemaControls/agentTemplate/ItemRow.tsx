@@ -3,6 +3,7 @@
  * tool/MCP/skill row, and the richer instructions-file row. All are dumb — they render an
  * {@link ItemDescriptor} and call back on open/remove; the section owners hold the state.
  */
+import {cn} from "@agenta/ui/styles"
 import {CaretRight, Trash} from "@phosphor-icons/react"
 import {Tag, Typography} from "antd"
 
@@ -23,8 +24,99 @@ export function ItemAvatar({descriptor}: {descriptor: ItemDescriptor}) {
 /**
  * A config-item row (a tool or MCP server): type avatar, name + description, type tags, and a
  * chevron. The whole row opens the item drawer; remove appears on hover.
+ *
+ * `locked` renders a read-only variant (muted fill, a "Locked" tag, no chevron/remove and no
+ * interaction) — used for platform-owned items that can be shown but not edited, e.g. the
+ * playground build kit. Passing no `onEdit` also makes the row non-interactive.
  */
 export function ItemRow({
+    descriptor,
+    onEdit,
+    onRemove,
+    disabled,
+    locked,
+}: {
+    descriptor: ItemDescriptor
+    onEdit?: () => void
+    onRemove?: () => void
+    disabled?: boolean
+    locked?: boolean
+}) {
+    const interactive = Boolean(onEdit) && !locked
+    return (
+        <div
+            role={interactive ? "button" : undefined}
+            tabIndex={interactive ? 0 : undefined}
+            onClick={interactive ? onEdit : undefined}
+            onKeyDown={
+                interactive
+                    ? (e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault()
+                              onEdit?.()
+                          }
+                      }
+                    : undefined
+            }
+            className={cn(
+                "group flex items-center gap-2.5 rounded border border-solid border-[var(--ag-c-EAEFF5,#eaeff5)] px-3 py-2 transition-colors",
+                interactive && "cursor-pointer hover:border-[var(--ag-c-97A4B0,#97a4b0)]",
+                locked && "bg-[var(--ant-color-fill-quaternary)] opacity-70",
+            )}
+        >
+            <ItemAvatar descriptor={descriptor} />
+            <div className="min-w-0 flex-1">
+                <div
+                    className={`truncate text-xs font-medium ${
+                        descriptor.monoName === false ? "" : "font-mono"
+                    }`}
+                >
+                    {descriptor.name}
+                </div>
+                {descriptor.description ? (
+                    <Typography.Text
+                        type="secondary"
+                        className="block truncate text-xs leading-tight"
+                    >
+                        {descriptor.description}
+                    </Typography.Text>
+                ) : null}
+            </div>
+            <div className="flex shrink-0 items-center gap-1.5">
+                {descriptor.tags.map((tag) => (
+                    <Tag key={tag} className="m-0 text-[11px]">
+                        {tag}
+                    </Tag>
+                ))}
+                {locked ? <Tag className="m-0 text-[11px]">Locked</Tag> : null}
+                {onRemove && !disabled && !locked ? (
+                    <button
+                        type="button"
+                        aria-label="Remove"
+                        onClick={(e) => {
+                            e.stopPropagation()
+                            onRemove()
+                        }}
+                        className="flex cursor-pointer items-center border-0 bg-transparent p-0 text-[var(--ag-c-97A4B0,#97a4b0)] opacity-0 transition-opacity hover:text-[var(--ag-c-FF4D4F,#ff4d4f)] group-hover:opacity-100"
+                    >
+                        <Trash size={14} />
+                    </button>
+                ) : null}
+                {interactive ? (
+                    <CaretRight size={14} className="text-[var(--ag-c-97A4B0,#97a4b0)]" />
+                ) : null}
+            </div>
+        </div>
+    )
+}
+
+/**
+ * A compact child row for an item nested under a provider group (e.g. a connected-app tool inside its
+ * app group): borderless, name + description, hover-remove + chevron. Mirrors the trigger section's
+ * subscription child rows so tools and triggers read the same. The provider is shown by the group
+ * header, so no avatar/tags here.
+ */
+export function ItemChildRow({
     descriptor,
     onEdit,
     onRemove,
@@ -41,31 +133,36 @@ export function ItemRow({
             tabIndex={0}
             onClick={onEdit}
             onKeyDown={(e) => {
+                if (e.target !== e.currentTarget) return
                 if (e.key === "Enter" || e.key === " ") {
                     e.preventDefault()
                     onEdit()
                 }
             }}
-            className="group flex cursor-pointer items-center gap-2.5 rounded border border-solid border-[var(--ag-c-EAEFF5,#eaeff5)] px-3 py-2 transition-colors hover:border-[var(--ag-c-97A4B0,#97a4b0)]"
+            className="group flex cursor-pointer items-center gap-2.5 rounded px-2.5 py-1.5 transition-colors hover:bg-[var(--ag-colorFillSecondary)]"
         >
-            <ItemAvatar descriptor={descriptor} />
             <div className="min-w-0 flex-1">
-                <div className="truncate font-mono text-xs font-medium">{descriptor.name}</div>
+                <div
+                    className={`truncate text-xs font-medium ${
+                        descriptor.monoName === false ? "" : "font-mono"
+                    }`}
+                >
+                    {descriptor.name}
+                </div>
                 {descriptor.description ? (
                     <Typography.Text
                         type="secondary"
-                        className="block truncate text-xs leading-tight"
+                        className="block truncate text-[11px] leading-snug"
                     >
                         {descriptor.description}
                     </Typography.Text>
                 ) : null}
             </div>
-            <div className="flex shrink-0 items-center gap-1.5">
-                {descriptor.tags.map((tag) => (
-                    <Tag key={tag} className="m-0 text-[11px]">
-                        {tag}
-                    </Tag>
-                ))}
+            <div
+                className="flex shrink-0 items-center gap-1.5"
+                onClick={(e) => e.stopPropagation()}
+                role="presentation"
+            >
                 {onRemove && !disabled ? (
                     <button
                         type="button"
