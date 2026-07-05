@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import type { AgentRunRequest, ResolvedToolSpec } from "../../protocol.ts";
-import { publicToolSpecs } from "../../tools/public-spec.ts";
+import { advertisedToolSpecs } from "../../tools/public-spec.ts";
 import type { MaterializedSkill } from "../skills.ts";
 import { PKG_ROOT } from "./daemon.ts";
 import type { RunPlan } from "./run-plan.ts";
@@ -33,7 +33,13 @@ export const EXTENSION_BUNDLE =
 export function buildPiExtensionEnv(
   request: AgentRunRequest,
   tracing: boolean,
-  opts: { relayDir?: string; usageOutPath?: string; skills?: string[] } = {},
+  opts: {
+    relayDir?: string;
+    usageOutPath?: string;
+    skills?: string[];
+    builtinGatingActive?: boolean;
+    builtinGrants?: string[];
+  } = {},
 ): Record<string, string> {
   const env: Record<string, string> = {};
   const propagation = tracing ? request.context?.propagation : undefined;
@@ -51,14 +57,20 @@ export function buildPiExtensionEnv(
   if (telemetry && opts.skills && opts.skills.length > 0)
     env.AGENTA_AGENT_SKILLS_LOADED = JSON.stringify(opts.skills);
 
-  const specs = publicToolSpecs(
+  const specs = advertisedToolSpecs(
     (request.customTools as ResolvedToolSpec[]) ?? [],
   );
   if (specs.length && opts.relayDir) {
     env.AGENTA_AGENT_TOOLS_PUBLIC_SPECS = JSON.stringify(specs);
     env.AGENTA_AGENT_TOOLS_RELAY_DIR = opts.relayDir;
   }
-  if (opts.usageOutPath) env.AGENTA_AGENT_USAGE_CAPTURE_PATH = opts.usageOutPath;
+  if (opts.builtinGatingActive) {
+    env.AGENTA_AGENT_BUILTIN_GATING = "1";
+    env.AGENTA_AGENT_BUILTIN_GRANTS = (opts.builtinGrants ?? []).join(",");
+    if (opts.relayDir) env.AGENTA_AGENT_TOOLS_RELAY_DIR = opts.relayDir;
+  }
+  if (opts.usageOutPath)
+    env.AGENTA_AGENT_USAGE_CAPTURE_PATH = opts.usageOutPath;
   return env;
 }
 

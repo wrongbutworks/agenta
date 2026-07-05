@@ -10,7 +10,7 @@
  *
  * The three executor kinds (see `ResolvedToolSpec`):
  *  - `code`: advertised to harnesses, but rejected by the sidecar as unsupported.
- *  - `client`: browser-fulfilled across a turn boundary; permission responder parks it.
+ *  - `client`: browser-fulfilled across a turn boundary; permission responder pauses it.
  *  - `callback` (default): POST back through Agenta's /tools/call so the Composio key and
  *    connection auth stay server-side. On Daytona the in-sandbox process can't reach Agenta,
  *    so the call is relayed through the runner via files (see tools/relay.ts) when `relayDir`
@@ -19,18 +19,29 @@
  * `relayToolCall` lives here (not in extensions/agenta.ts) so this module is the single
  * dispatch home with no import cycle back into a call site.
  */
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 
 import type { ResolvedToolSpec } from "../protocol.ts";
 import { callAgentaTool } from "./callback.ts";
 import { runCodeTool } from "./code.ts";
+import { assertRequiredArguments } from "./spec-schema.ts";
 import {
+  RELAY_PERMISSION_PROTOCOL,
   RELAY_POLL_MS,
   RELAY_REQ_SUFFIX,
   RELAY_RES_SUFFIX,
   RELAY_TIMEOUT_MS,
+  parsePermissionRelayResponse,
   sanitizeRelayId,
   sleep,
+  type PermissionRelayRequest,
+  type PermissionRelayResponse,
   type RelayResponse,
 } from "./relay.ts";
 
@@ -46,64 +57,6 @@ export interface RunResolvedToolOpts {
   relayDir?: string;
   /** Caller cancellation, combined with the per-tool timeout. */
   signal?: AbortSignal;
-}
-
-function objectSchema(schema: unknown): Record<string, unknown> | undefined {
-  return schema && typeof schema === "object" && !Array.isArray(schema)
-    ? (schema as Record<string, unknown>)
-    : undefined;
-}
-
-function requiredFields(schema: unknown): string[] {
-  const object = objectSchema(schema);
-  const required = object?.required;
-  return Array.isArray(required)
-    ? required.filter((field): field is string => typeof field === "string")
-    : [];
-}
-
-function specInputSchema(spec: ResolvedToolSpec): Record<string, unknown> | null | undefined {
-  return (
-    spec.inputSchema ??
-    (spec as ResolvedToolSpec & { input_schema?: Record<string, unknown> | null })
-      .input_schema
-  );
-}
-
-function missingRequiredFields(
-  schema: unknown,
-  value: unknown,
-  path: string[] = [],
-): string[] {
-  const object = objectSchema(schema);
-  if (!object) return [];
-
-  const missing: string[] = [];
-  const required = requiredFields(object);
-  const record = objectSchema(value);
-  for (const field of required) {
-    if (!record || record[field] === undefined || record[field] === null) {
-      missing.push([...path, field].join("."));
-    }
-  }
-
-  const properties = objectSchema(object.properties);
-  if (!properties || !record) return missing;
-  for (const [field, childSchema] of Object.entries(properties)) {
-    if (record[field] !== undefined && record[field] !== null) {
-      missing.push(...missingRequiredFields(childSchema, record[field], [...path, field]));
-    }
-  }
-  return missing;
-}
-
-function assertRequiredArguments(spec: ResolvedToolSpec, params: unknown): void {
-  const missing = missingRequiredFields(specInputSchema(spec), params);
-  if (missing.length === 0) return;
-  throw new Error(
-    `Tool '${spec.name}' missing required argument(s): ${missing.join(", ")}. ` +
-      "Retry the tool call with those argument fields populated.",
-  );
 }
 
 /**
@@ -125,7 +78,11 @@ export async function relayToolCall(
   } catch {
     // The runner also creates it; a race here is harmless.
   }
-  writeFileSync(reqPath, JSON.stringify({ toolName, toolCallId, args: params ?? {} }), "utf-8");
+  writeFileSync(
+    reqPath,
+    JSON.stringify({ toolName, toolCallId, args: params ?? {} }),
+    "utf-8",
+  );
 
   const deadline = Date.now() + RELAY_TIMEOUT_MS;
   while (Date.now() < deadline) {
@@ -150,12 +107,114 @@ export async function relayToolCall(
   throw new Error(`tool relay timed out for ${toolName}`);
 }
 
+function oneLineReason(reason: string): string {
+  return reason.replace(/\s+/g, " ").trim() || "Permission check failed.";
+}
+
+function denyPermissionRelayResponse(reason: string): PermissionRelayResponse {
+  return {
+    kind: "permission",
+    ok: false,
+    verdict: "deny",
+    reason: oneLineReason(reason),
+  };
+}
+
+/**
+ * Pi builtin permission check: write a permission request into the same relay directory the
+ * runner watches for tool execution, then poll for its permission response. The extension must
+ * fail closed because returning nothing lets Pi execute the builtin.
+ */
+export async function relayPermissionCheck(
+  dir: string,
+  toolName: string,
+  toolCallId: string,
+  args: unknown,
+): Promise<PermissionRelayResponse> {
+  const id = sanitizeRelayId(toolCallId);
+  const reqPath = `${dir}/${id}${RELAY_REQ_SUFFIX}`;
+  const resPath = `${dir}/${id}${RELAY_RES_SUFFIX}`;
+  try {
+    mkdirSync(dir, { recursive: true });
+  } catch {
+    // The runner also creates it; a race here is harmless.
+  }
+
+  const req: PermissionRelayRequest = {
+    kind: "permission",
+    protocol: RELAY_PERMISSION_PROTOCOL,
+    toolName,
+    toolCallId,
+    args: args ?? {},
+  };
+  try {
+    writeFileSync(reqPath, JSON.stringify(req), "utf-8");
+  } catch (err) {
+    return denyPermissionRelayResponse(
+      `permission relay request for ${toolName} could not be written: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+
+  const cleanup = (): void => {
+    try {
+      unlinkSync(reqPath);
+    } catch {
+      /* best-effort cleanup */
+    }
+    try {
+      unlinkSync(resPath);
+    } catch {
+      /* best-effort cleanup */
+    }
+  };
+
+  const deadline = Date.now() + RELAY_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (existsSync(resPath)) {
+      let parsed: PermissionRelayResponse | undefined;
+      try {
+        parsed = parsePermissionRelayResponse(
+          JSON.parse(readFileSync(resPath, "utf-8")),
+        );
+      } catch {
+        cleanup();
+        return denyPermissionRelayResponse(
+          `permission relay response for ${toolName} was unparseable`,
+        );
+      }
+      cleanup();
+      if (!parsed) {
+        return denyPermissionRelayResponse(
+          `permission relay response for ${toolName} was unparseable`,
+        );
+      }
+      if (!parsed.ok) {
+        return denyPermissionRelayResponse(
+          parsed.reason || `permission relay failed for ${toolName}`,
+        );
+      }
+      return parsed;
+    }
+    await sleep(RELAY_POLL_MS);
+  }
+  try {
+    unlinkSync(reqPath);
+  } catch {
+    /* best-effort cleanup */
+  }
+  return denyPermissionRelayResponse(
+    `permission relay timed out for ${toolName}`,
+  );
+}
+
 /**
  * Execute one resolved tool and return its result text. Throws on failure; every call site
  * turns the throw into a tool-error result so the model loop continues rather than crashing.
  *
  *  - `code`   -> reject as unsupported by the sidecar, no callback/relay.
- *  - `client` → relay to the runner so it can park the browser-fulfilled call.
+ *  - `client` → relay to the runner so it can pause the browser-fulfilled call.
  *  - default/`callback` → relay through the runner when `opts.relayDir` is set (Daytona),
  *    else POST directly to `opts.endpoint`.
  */
@@ -166,17 +225,37 @@ export async function runResolvedTool(
 ): Promise<string> {
   assertRequiredArguments(spec, params);
   if (spec.kind === "code") {
-    return runCodeTool(spec.runtime, spec.code ?? "", spec.env, params, opts.signal);
+    return runCodeTool(
+      spec.runtime,
+      spec.code ?? "",
+      spec.env,
+      params,
+      opts.signal,
+    );
   }
   if (spec.kind === "client") {
     if (opts.relayDir) {
-      return relayToolCall(opts.relayDir, spec.name, opts.toolCallId, params, opts.signal);
+      return relayToolCall(
+        opts.relayDir,
+        spec.name,
+        opts.toolCallId,
+        params,
+        opts.signal,
+      );
     }
-    throw new Error(`client tool '${spec.name}' is browser-fulfilled and cannot be executed`);
+    throw new Error(
+      `client tool '${spec.name}' is browser-fulfilled and cannot be executed`,
+    );
   }
   // callback (default): route back to Agenta's /tools/call (directly or via the Daytona relay).
   if (opts.relayDir) {
-    return relayToolCall(opts.relayDir, spec.name, opts.toolCallId, params, opts.signal);
+    return relayToolCall(
+      opts.relayDir,
+      spec.name,
+      opts.toolCallId,
+      params,
+      opts.signal,
+    );
   }
   return callAgentaTool(
     opts.endpoint ?? "",

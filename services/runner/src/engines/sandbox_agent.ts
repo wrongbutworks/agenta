@@ -23,8 +23,9 @@
  * so it is uniform across every harness and always nests under the caller's /invoke
  * span. stdout is reserved for the JSON result (see cli.ts); logs go to stderr.
  */
-import { apiBase } from "../apiBase.ts";
 import { rmSync } from "node:fs";
+
+import { apiBase } from "../apiBase.ts";
 
 import { SandboxAgent, InMemorySessionPersistDriver } from "sandbox-agent";
 
@@ -33,19 +34,27 @@ import {
   localRelayHost,
   sandboxRelayHost,
   startToolRelay,
+  type RelayPermissions,
 } from "../tools/relay.ts";
 import {
-  HITLResponder,
+  ApprovalResponder,
+  ConversationDecisions,
   extractApprovalDecisions,
-  nonConvergingToolNames,
-  policyFromRequest,
+  extractClientToolOutputs,
+  type ClientToolOutcome,
   type Responder,
 } from "../responder.ts";
+import type { ClientToolRelay } from "../tools/client-tool-relay.ts";
+import {
+  buildClientToolRelay,
+  createToolCallCorrelationIndex,
+} from "./sandbox_agent/client-tools.ts";
 import {
   type AgentRunRequest,
   type AgentRunResult,
   type EmitEvent,
   type ToolCallbackContext,
+  type ToolPermission,
   resolveRunSessionId,
 } from "../protocol.ts";
 import {
@@ -67,7 +76,16 @@ import {
   buildPiExtensionEnv,
   prepareLocalPiAssets,
 } from "./sandbox_agent/pi-assets.ts";
-import { attachPermissionResponder } from "./sandbox_agent/permissions.ts";
+import {
+  decide,
+  PendingApprovalLatch,
+  permissionsFromRequest,
+} from "../permission-plan.ts";
+import { attachPermissionResponder } from "./sandbox_agent/acp-interactions.ts";
+import {
+  PAUSED,
+  PendingApprovalPauseController,
+} from "./sandbox_agent/pause.ts";
 import {
   createInteraction,
   resolveInteraction,
@@ -109,6 +127,17 @@ function runCredential(request: AgentRunRequest): string {
   return (headers["authorization"] ?? headers["Authorization"] ?? "").trim();
 }
 
+function serverPermissionsFromRequest(
+  request: AgentRunRequest,
+): ReadonlyMap<string, ToolPermission> {
+  const permissions = new Map<string, ToolPermission>();
+  for (const server of request.mcpServers ?? []) {
+    if (server.permission !== undefined) {
+      permissions.set(server.name, server.permission);
+    }
+  }
+  return permissions;
+}
 
 type Log = (message: string) => void;
 const LOCAL_DURABLE_CWD_ENOTCONN_REMOUNT_LIMIT = 1;
@@ -142,6 +171,19 @@ export async function destroyInFlightSandboxes(
     sweep,
     new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
   ]);
+}
+
+function shouldSuppressPausedToolCallUpdate(
+  update: unknown,
+  pause: PendingApprovalPauseController,
+): boolean {
+  const frame = update as
+    { sessionUpdate?: unknown; toolCallId?: unknown } | undefined;
+  const kind = frame?.sessionUpdate;
+  if (kind !== "tool_call" && kind !== "tool_call_update") return false;
+  const toolCallId =
+    typeof frame?.toolCallId === "string" ? frame.toolCallId : undefined;
+  return pause.isPausedToolCall(toolCallId);
 }
 
 const CLAUDE_STRICT_DEPLOYMENTS = new Set([
@@ -194,7 +236,9 @@ function applyClaudeConnectionEnv(
   ) {
     env.ANTHROPIC_MODEL = selectedModel;
     env.ANTHROPIC_CUSTOM_MODEL_OPTION = selectedModel;
-    logger(`claude model=${selectedModel} deployment=${deployment ?? "<none>"}`);
+    logger(
+      `claude model=${selectedModel} deployment=${deployment ?? "<none>"}`,
+    );
     return true;
   }
   return false;
@@ -220,7 +264,7 @@ export interface SandboxAgentDeps extends BuildRunPlanDeps {
   mountStorageRemote?: typeof mountStorageRemote;
   unmountStorage?: typeof unmountStorage;
   discoverTunnelEndpoint?: typeof discoverTunnelEndpoint;
-  responderFactory?: (permissionPolicy: string | undefined) => Responder;
+  responderFactory?: (request: AgentRunRequest) => Responder;
   log?: Log;
 }
 
@@ -340,6 +384,8 @@ export async function runSandboxAgent(
     ? buildPiExtensionEnv(request, !plan.isDaytona, {
         relayDir: plan.relayDir,
         usageOutPath: plan.usageOutPath,
+        builtinGatingActive: plan.builtinGatingActive,
+        builtinGrants: plan.builtinGrants,
         // The materialized skill names (author + forced `_agenta.*`) so Pi's own agent span
         // records which skills loaded (F-029); local Pi self-instruments, so the runner's
         // sandbox-agent otel has no span to stamp here.
@@ -377,6 +423,10 @@ export async function runSandboxAgent(
   // Internal gateway-tool MCP server closer (set when an internal channel is built for a non-Pi
   // harness with executable tools; a no-op otherwise). Released in the `finally`.
   let closeToolMcp: (() => Promise<void>) | undefined;
+  // Aborts any in-flight loopback `tools/call` (a paused Claude client tool) on pause/teardown,
+  // so its handler is torn down deterministically and cannot write a result after the turn ends.
+  // Fired by the pause controller's destroy path and, as a backstop, by the `finally`.
+  const mcpAbort = new AbortController();
   // Durable cwd: set to the host mountpoint once a session-owned local run geesefs-mounts its
   // store prefix, so the `finally` can unmount it. Undefined for non-session/remote/unmounted runs.
   let mountedCwd: string | undefined;
@@ -466,7 +516,7 @@ export async function runSandboxAgent(
       // Propagate caller cancellation (a client disconnect on the streaming HTTP edge) so an
       // in-flight run aborts instead of finishing unobserved. The `finally` still disposes.
       ...(signal ? { signal } : {}),
-      // Drive the ACP HTTP client through a long-timeout undici dispatcher so a parked HITL
+      // Drive the ACP HTTP client through a long-timeout undici dispatcher so a paused HITL
       // turn (the connection held open while a human approves a tool) is NOT reaped by
       // undici's default `headersTimeout` (which would kill it with UND_ERR_HEADERS_TIMEOUT).
       // Daytona additionally needs the per-sandbox auth cookie carried across requests, so it
@@ -578,6 +628,23 @@ export async function runSandboxAgent(
       log: logger,
     });
 
+    // Correlate a Claude MCP `tools/call` (name + args only) to the real ACP tool-call id the
+    // event stream surfaces, so a paused `client_tool` widget attaches to Claude's tool bubble.
+    const toolCallIndex = createToolCallCorrelationIndex();
+    // The shared client-tool relay is only built AFTER the session/model resolve (it needs the
+    // responder + otel run + pause plumbing). But the internal MCP server is built HERE (its URL
+    // is handed to createSession) and pauses client tools through that relay. A `tools/call` can
+    // only arrive during `session.prompt()` — long after the relay is wired — so the server
+    // captures a DEFERRED reference that resolves to the real relay before any call lands.
+    let clientToolRelay: ClientToolRelay | undefined;
+    const deferredClientToolRelay: ClientToolRelay = {
+      onClientTool: (req) =>
+        clientToolRelay
+          ? clientToolRelay.onClientTool(req)
+          : Promise.resolve("deny" as ClientToolOutcome),
+      onPause: (req) => clientToolRelay?.onPause?.(req),
+    };
+
     const sessionMcp = await buildSessionMcpServers({
       isPi: plan.isPi,
       capabilities,
@@ -588,6 +655,11 @@ export async function runSandboxAgent(
       toolSpecs: plan.toolSpecs,
       userMcpServers: request.mcpServers,
       relayDir: plan.relayDir,
+      // Any LOCAL non-Pi harness (Claude today): lets the internal channel advertise + pause
+      // `client` tools. The deferred ref resolves before any `tools/call` arrives.
+      // buildSessionMcpServers ignores it for Pi / Daytona (no internal channel there).
+      clientToolRelay: deferredClientToolRelay,
+      signal: mcpAbort.signal,
       log: logger,
     });
     // Close the internal gateway-tool MCP server (if one started) when the run ends.
@@ -635,89 +707,105 @@ export async function runSandboxAgent(
       ],
     });
 
+    const pause = new PendingApprovalPauseController(() => {
+      // Abort any in-flight loopback `tools/call` (a paused Claude client tool) BEFORE the
+      // session teardown, so its handler cannot write a result after the turn ends.
+      mcpAbort.abort();
+      return sandbox.destroySession?.(session.id);
+    });
+
     session.onEvent((event: any) => {
       remountLocalCwdAfterRuntimeEnotconn(event);
       const payload = event?.payload;
       const update = payload?.params?.update ?? payload?.update;
-      if (update) run.handleUpdate(update);
-    });
-
-    // Cross-turn HITL: when the request carries a platform `sessionId` it came through the
-    // `/messages` endpoint, which validates and stamps a session id on every turn and replays
-    // the conversation — i.e. there is a browser that can answer a permission prompt. The
-    // headless `/invoke` path sets no session id. With no human surface and no stored
-    // decisions the HITLResponder falls back to the base policy and is byte-identical to the
-    // old PolicyResponder, so `/invoke` is unchanged.
-    const hasHumanSurface = !!(request.sessionId && request.sessionId.trim());
-    // A park (cross-turn HITL) must END the turn gracefully, not hold the ACP connection open
-    // forever (F-040): Claude does not end a turn on an unanswered gate, so `session.prompt()`
-    // would block indefinitely, the sandbox would leak, and the egress would never emit a
-    // `finish` frame. On the first park we `destroySession`, which (a) resolves the pending
-    // permission RPC with `{outcome:"cancelled"}` — NOT a reject, so no F-024 clobber — and
-    // (b) sends the managed `session/cancel` so the in-flight `prompt()` resolves with a
-    // cancelled stop reason. The resume then cold-replays as a fresh turn (#4854).
-    let parked = false;
-    let resolveParked: (() => void) | undefined;
-    const parkedSignal = new Promise<void>((resolve) => {
-      resolveParked = resolve;
-    });
-    const onPark = (): void => {
-      if (parked) return; // first park wins; later gates this turn are moot once we cancel
-      parked = true;
-      resolveParked?.();
-      // Cancel the in-flight prompt so `session.prompt()` returns instead of hanging. The
-      // managed cancel lives on the SandboxAgent handle (the `Session` wrapper has none).
-      // Best effort: the `finally` disposes the sandbox regardless, and the prompt is also
-      // raced against `parkedSignal` below so the turn ends even if this call rejects.
-      void sandbox.destroySession?.(session.id).catch(() => {});
-    };
-    const responder =
-      deps.responderFactory?.(request.permissionPolicy) ??
-      (() => {
-        const decisions = extractApprovalDecisions(request);
-        const looping = nonConvergingToolNames(request);
-        // Dump the STORED side of the HITL resume: the decision keys the transcript folded and any
-        // tools flagged as non-converging. Compare against the runner's `[HITL] gate ...` lines
-        // (the LIVE re-raised keys) to see exactly what drifted.
-        if (hasHumanSurface) {
-          logger(
-            `[HITL] resume state: humanSurface=${hasHumanSurface} ` +
-              `decisions=${JSON.stringify([...decisions.keys()])} ` +
-              `looping=${JSON.stringify([...looping])}`,
-          );
+      if (update) {
+        // Record live ACP tool_call ids so a paused client_tool can correlate to Claude's
+        // bubble (recorded even for suppressed frames; a lookup CONSUMES its matched id).
+        toolCallIndex.record(update);
+        if (!shouldSuppressPausedToolCallUpdate(update, pause)) {
+          run.handleUpdate(update);
         }
-        return new HITLResponder(
-          decisions,
-          policyFromRequest(request.permissionPolicy),
-          hasHumanSurface,
-          looping,
-          logger,
-        );
-      })();
+      }
+    });
+    const permissionPlan = permissionsFromRequest(request);
+    const storedDecisionMap = extractApprovalDecisions(request);
+    if (storedDecisionMap.size > 0) {
+      logger(
+        `[HITL] resume state: decisions=${JSON.stringify([...storedDecisionMap.keys()])}`,
+      );
+    }
+    const decisions = new ConversationDecisions(
+      storedDecisionMap,
+      extractClientToolOutputs(request),
+    );
+    const latch = new PendingApprovalLatch();
+    const responder =
+      deps.responderFactory?.(request) ??
+      new ApprovalResponder(permissionPlan, decisions, logger);
+    // Every pause seeds the durable interactions plane, whichever gate paused (the ACP
+    // responder on Claude, the relay on Pi). Shared by both wiring sites below.
+    const recordPendingInteraction = (
+      token: string,
+      toolName: string | undefined,
+      toolArgs: unknown,
+      kind: "user_approval" | "client_tool" = "user_approval",
+    ): void => {
+      const cred = runCredential(request);
+      if (!cred) return;
+      // The /interactions plane only works when respond can re-invoke THIS revision, which
+      // needs at least a committed workflow_revision reference. A draft (inline config, no
+      // committed revision) can't be re-resolved, so skip create and stay messages-only.
+      const references = buildWorkflowReferences(request.runContext?.workflow);
+      if (!references?.workflow_revision) return;
+      void createInteraction(
+        sessionId,
+        request.turnId ?? "",
+        token,
+        kind,
+        { request: { tool: toolName ?? token, args: toolArgs }, references },
+        () => cred,
+      );
+    };
+    // Exactly one gate per call: the harness gate on Claude, the relay on Pi. If more
+    // harness families arrive, move this capability split to engines/sandbox_agent/capabilities.ts.
+    const relayPermissions: RelayPermissions = {
+      enforce: plan.isPi,
+      decide: (gate) => decide(gate, permissionPlan, decisions),
+      onPendingApproval: ({ toolCallId, toolName, args }) => {
+        if (!latch.tryAcquire()) return { emitted: false };
+        pause.markPausedToolCall(toolCallId);
+        run.emitEvent({
+          type: "interaction_request",
+          id: toolCallId,
+          kind: "user_approval",
+          payload: {
+            toolCallId,
+            toolCall: {
+              toolCallId,
+              name: toolName,
+              title: toolName,
+              rawInput: args,
+              input: args,
+            },
+            availableReplies: ["once", "reject"],
+          },
+        });
+        recordPendingInteraction(toolCallId, toolName, args);
+        pause.pause();
+        return { emitted: true };
+      },
+    };
+    const serverPermissions = serverPermissionsFromRequest(request);
     attachPermissionResponder({
       session,
       run,
+      responder,
+      latch,
+      serverPermissions,
       log: logger,
-      onPark,
-      onCreateInteraction: (token, toolName, toolArgs) => {
-        const cred = runCredential(request);
-        if (!cred) return;
-        // The /interactions plane only works when respond can re-invoke THIS revision, which
-        // needs at least a committed workflow_revision reference. A draft (inline config, no
-        // committed revision) can't be re-resolved, so skip create and stay messages/park-only.
-        const references = buildWorkflowReferences(
-          request.runContext?.workflow,
-        );
-        if (!references?.workflow_revision) return;
-        void createInteraction(
-          sessionId,
-          request.turnId ?? "",
-          token,
-          "user_approval",
-          { request: { tool: toolName ?? token, args: toolArgs }, references },
-          () => cred,
-        );
-      },
+      onPause: () => pause.pause(),
+      onPausedToolCall: (id) => pause.markPausedToolCall(id),
+      onCreateInteraction: recordPendingInteraction,
       onResolveInteraction: (token) => {
         const cred = runCredential(request);
         if (!cred) return;
@@ -729,13 +817,24 @@ export async function runSandboxAgent(
           return;
         void resolveInteraction(sessionId, token, () => cred);
       },
+    });
+
+    // Resolve the ONE client-tool seam both delivery paths share: the Pi file relay (below)
+    // consumes it directly, and the Claude internal MCP server reaches it through the deferred
+    // ref captured above. Built here because it needs the responder, the otel run, and the pause
+    // plumbing. The correlation index is wired for Claude only — Pi's relay toolCallId is
+    // already exact, so it pauses with no index (behavior-preserving).
+    clientToolRelay = buildClientToolRelay({
       responder,
+      run,
+      latch,
+      pause,
+      recordPendingInteraction,
+      toolCallIndex: plan.isPi ? undefined : toolCallIndex,
+      log: logger,
     });
 
     if (plan.useToolRelay) {
-      // Layer 3 (S3b): the relay enforces each resolved tool's `permission`; an `ask`/unset
-      // permission degrades to the run's headless permission policy (the same policy the
-      // PolicyResponder uses for Claude builtins above).
       toolRelay = (deps.startToolRelay ?? startToolRelay)(
         plan.isDaytona
           ? (deps.sandboxRelayHost ?? sandboxRelayHost)(sandbox)
@@ -743,72 +842,34 @@ export async function runSandboxAgent(
         plan.relayDir,
         plan.toolSpecs,
         request.toolCallback as ToolCallbackContext | undefined,
-        policyFromRequest(request.permissionPolicy),
+        relayPermissions,
         request.runContext,
-        {
-          onClientTool: async ({ id, toolCallId, toolName, input, spec }) => {
-            const decision = await responder.onClientTool({
-              id,
-              toolCallId,
-              toolName,
-              input,
-              raw: { spec },
-            });
-            if (process.env.AGENTA_RUNNER_DEBUG_TOOLS)
-              logger(
-                `[client-tool] ${toolName} id=${toolCallId} kind=${spec.kind} decision=${typeof decision === "string" ? decision : JSON.stringify(decision).slice(0, 200)}`,
-              );
-            if (decision === "park") {
-              run.emitEvent({
-                type: "interaction_request",
-                id,
-                kind: "client_tool",
-                payload: {
-                  toolCallId,
-                  toolName,
-                  input,
-                  render: spec.render,
-                  toolCall: {
-                    id: toolCallId,
-                    toolCallId,
-                    name: toolName,
-                    rawInput: input,
-                    input,
-                    kind: spec.kind,
-                  },
-                },
-              });
-            }
-            return decision;
-          },
-          onPark,
-        },
+        clientToolRelay,
       );
     }
 
-    // Race the prompt against the park signal: on a HITL park the prompt either resolves with
+    // Race the prompt against the pause signal: on a HITL pause the prompt either resolves with
     // a cancelled stop reason (the managed `session/cancel` landed) or never resolves at all
-    // (the harness ignores it) — either way `parkedSignal` ends the turn so the runner returns
+    // (the harness ignores it) — either way the pause signal ends the turn so the runner returns
     // promptly, the `finally` disposes the sandbox (no leak, F-040), and the egress emits a
-    // `finish` frame. When the park wins, the orphaned `prompt()` may later reject as the
+    // `finish` frame. When the pause wins, the orphaned `prompt()` may later reject as the
     // cancelled/torn-down connection unwinds; swallow that so it is not an `unhandledRejection`
     // (the daemon teardown's `fetch failed` is expected on a cancel, not a run error).
-    const PARKED = Symbol("parked");
     const promptPromise = Promise.resolve(
       session.prompt([{ type: "text", text: plan.turnText }]),
     );
     promptPromise.catch(() => {});
     const raced = await Promise.race([
       promptPromise,
-      parkedSignal.then(() => PARKED),
+      pause.signal.then(() => PAUSED),
     ]);
-    await toolRelay?.stop();
-    // A parked turn is terminal-but-incomplete: stop reason `paused` tells the egress to emit
+    // A paused turn is terminal-but-incomplete: stop reason `paused` tells the egress to emit
     // a clean `finish` (the FE then resumes on the user's decision). A real prompt result keeps
     // the harness's own stop reason.
     const stopReason =
-      raced === PARKED || parked ? "paused" : (raced as any)?.stopReason;
-    const result = raced === PARKED ? undefined : raced;
+      raced === PAUSED || pause.active ? "paused" : (raced as any)?.stopReason;
+    const result = raced === PAUSED ? undefined : raced;
+    await toolRelay?.stop();
     logger(`prompt stopReason=${stopReason}`);
 
     // Usage: Pi writes its totals to a file via the extension. Other harnesses report the
@@ -892,6 +953,8 @@ export async function runSandboxAgent(
     await runtimeRemount?.catch(() => {});
     if (sandbox) inFlightSandboxes.delete(sandbox);
     await toolRelay?.stop().catch(() => {});
+    // Teardown backstop: destroy any in-flight loopback `tools/call` before closing the server.
+    mcpAbort.abort();
     await closeToolMcp?.().catch(() => {});
     await sandbox?.destroySandbox().catch(() => {});
     await sandbox?.dispose().catch(() => {});
