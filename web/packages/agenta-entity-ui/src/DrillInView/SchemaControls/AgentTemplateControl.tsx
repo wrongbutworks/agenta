@@ -311,6 +311,8 @@ export function AgentTemplateControl({
         handleRemoveToolByName,
         handleRemoveBuiltinTool,
         selectedToolNames,
+        selectedGatewayIds,
+        removeGatewayToolByIdentity,
         referenceableWorkflows,
     } = useAgentTools({config, onChange, configRef, openCreate, workflowReference})
 
@@ -922,8 +924,8 @@ export function AgentTemplateControl({
                         setIntegrationDefaultKey(undefined)
                     }}
                     onAddTool={handleAddTool}
-                    onRemoveTool={handleRemoveToolByName}
-                    selectedToolNames={selectedToolNames}
+                    onRemoveToolByIdentity={removeGatewayToolByIdentity}
+                    selectedGatewayIds={selectedGatewayIds}
                     defaultIntegrationKey={integrationDefaultKey}
                 />
             )}
