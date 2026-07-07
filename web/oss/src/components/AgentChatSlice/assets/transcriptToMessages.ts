@@ -106,9 +106,10 @@ function applyEvent(draft: DraftMessage, payload: Record<string, unknown>): void
             return
         }
         case "interaction_request": {
-            // v1 scope: HITL permission only (matches the backend's `user_approval`). An
-            // `input`/`client_tool` request is left unrendered until those are wired.
-            if (payload.kind !== "permission") return
+            // v1 scope: HITL approvals only. The runner emits `kind` `user_approval` for the
+            // Approve/Deny gate; `user_input`/`client_tool` are left to their tool_call/result
+            // parts (a client tool isn't approve/deny) until those are wired.
+            if (payload.kind !== "user_approval") return
             const reqPayload = (payload.payload ?? {}) as Record<string, unknown>
             const toolCall = (reqPayload.toolCall ?? {}) as Record<string, unknown>
             const toolCallId = str(

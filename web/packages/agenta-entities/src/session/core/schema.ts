@@ -9,17 +9,35 @@
  */
 import {z} from "zod"
 
-/** One durable, append-only record event row. `payload` is the ACP `AgentEvent`. */
-export const sessionRecordSchema = z.object({
-    id: z.string(),
-    session_id: z.string(),
-    project_id: z.string(),
-    event_index: z.number().nullish(),
-    sender: z.string().nullish(),
-    session_update: z.string().nullish(),
-    payload: z.record(z.string(), z.unknown()).nullish(),
-    created_at: z.string().nullish(),
-})
+/**
+ * One durable, append-only record event row. Validates the wire shape (backend renamed the
+ * envelope: `record_id`/`record_index`/`record_source`/`record_type`/`attributes`) and maps
+ * it back to the consumer-facing names (`id`/`sender`/`payload`/…), so `transcriptToMessages`
+ * keeps reading `row.payload`/`row.sender`/`row.id` and any future wire-rename stays here.
+ * `payload`/`attributes` is the opaque ACP `AgentEvent`.
+ */
+export const sessionRecordSchema = z
+    .object({
+        record_id: z.string(),
+        session_id: z.string(),
+        project_id: z.string(),
+        record_index: z.number().nullish(),
+        record_source: z.string().nullish(),
+        record_type: z.string().nullish(),
+        attributes: z.record(z.string(), z.unknown()).nullish(),
+        timestamp: z.string().nullish(),
+        created_at: z.string().nullish(),
+    })
+    .transform((r) => ({
+        id: r.record_id,
+        session_id: r.session_id,
+        project_id: r.project_id,
+        event_index: r.record_index ?? null,
+        sender: r.record_source ?? null,
+        session_update: r.record_type ?? null,
+        payload: r.attributes ?? null,
+        created_at: r.created_at ?? r.timestamp ?? null,
+    }))
 
 export const sessionRecordsQueryResponseSchema = z.object({
     count: z.number(),
@@ -47,20 +65,14 @@ export const sessionStateResponseSchema = z.object({
 
 export type SessionState = z.infer<typeof sessionStateSchema>
 
-/** A HITL request raised mid-run. `status.code` carries the lifecycle (pending/responded/…). */
+/** A HITL request raised mid-run. `status` is the lifecycle enum (pending/responded/…). */
 export const sessionInteractionSchema = z.object({
     id: z.string().nullish(),
     session_id: z.string(),
-    run_id: z.string().nullish(),
-    token: z.string(),
+    turn_id: z.string().nullish(),
+    token: z.string().nullish(),
     kind: z.string(),
-    status: z
-        .object({
-            code: z.string().nullish(),
-            type: z.string().nullish(),
-            message: z.string().nullish(),
-        })
-        .nullish(),
+    status: z.string().nullish(),
     data: z
         .object({
             request: z.record(z.string(), z.unknown()).nullish(),
